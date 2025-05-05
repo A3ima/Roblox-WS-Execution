@@ -1,161 +1,130 @@
-const VSCode                                = require("vscode")
-const Helmet                                = require("helmet")
-const Express                               = require("express")
-const WebSocket                             = require("express-ws")
+const vscode    = require("vscode");
+const helmet    = require("helmet");
+const express   = require("express");
+const expressWs = require("express-ws");
 
-const Connections					        = []
-const App 									= WebSocket(Express()).app
+const connections = [];
+const app        = expressWs(express()).app;
 
-/*
-
-10 - Failed Parsing
-20 - Invalid Method
-30 - Success
-
-*/
-
-App.use(Helmet.contentSecurityPolicy({
-	directives: {
-		defaultSrc: ["'self'"],
-		scriptSrc: ["'self'"],
-		connectSrc: ["'self'", "ws://localhost:9000"]
-	},
-}))
-
-App.all("/", (Request, Respond) => {
-	Respond.end("Roblox WS Execution")
-})
-
-App.ws("/", (WS) => {
-	setTimeout(() => {
-		if (Connections.some(Connection => Connection.WS === WS)) return
-
-		WS.close()
-		VSCode.window.showInformationMessage(`Connected user failed to authenticate, Closing connection..`)
-	}, 500)
-
-	WS.on("message", (Unparsed) => {
-		const Parsed						= (() => { try { return JSON.parse(Unparsed) } catch (Error) { return false } })()
-
-		if (!Parsed) return WS.send(JSON.stringify({ ["Code"]: 10 }))
-		if (!Parsed.Method) return WS.send(JSON.stringify({ ["Code"]: 20 }))
-
-		if (Parsed.Method === "Authorization") {
-			const Check						= Connections.find(Connection => Connection.Name === Parsed.Name)
-
-			if (Check) { VSCode.window.showInformationMessage(`Updated WS for ${Parsed.Name}.`); return Check.WS = WS }
-
-			VSCode.window.showInformationMessage(`User ${Parsed.Name} Connected.`)
-			Connections.push({ WS: WS, Name: Parsed.Name })
-		}
-
-		if (Parsed.Method === "Error") {
-			VSCode.window.showErrorMessage(Parsed.Message)
-		}
-
-		WS.send(JSON.stringify({ ["Code"]: 30 }))
-	})
-
-	WS.on("close", () => {
-		const Index							= Connections.findIndex(Connection => Connection.WS === WS)
-
-		if (Index == -1) return
-
-		Connections.splice(Index, 1)
-		console.log("WebSocket Disconnected.")
-	})
-})
-
-App.listen(9000)
-
-function Activated(Context, Status) {
-	const Commands							= []
-	const CheckIfOpened						= Context.globalState.get("CheckIfOpened", false)
-	const Execute							= VSCode.window.createStatusBarItem(VSCode.StatusBarAlignment.Left, -1000)
-	Execute.command							= "roblox-ws-server.execute"
-	Execute.text							= "$(notebook-execute) WS Execute"
-	Execute.show()
-
-	if (!CheckIfOpened) {
-		VSCode.window.showWarningMessage(`The loadstring has changed, please make sure you updated it.\nThis won't happen again and sorry for the inconvenience.\n`, "OPEN").then((Selection) => {
-			if (Selection !== "OPEN") return
-
-			VSCode.env.openExternal(VSCode.Uri.parse(
-				"https://raw.githubusercontent.com/Incognito-Tabs/Roblox-WS-Execution/main/Loadstring.lua"
-			)).then((Success) => {
-				if (!Success) return
-
-				Context.globalState.update("CheckIfOpened", true)
-			})
-		})
-	}
-
-	Context.subscriptions.push(VSCode.commands.registerCommand("roblox-ws-server.debug", () => {
-		VSCode.window.showInformationMessage("Roblox WS Execution Running.")
-	}))
-
-	Context.subscriptions.push(VSCode.commands.registerCommand("roblox-ws-server.resetglobals", () => {
-		VSCode.window.showInformationMessage("Reset The Globals.")
-
-		Context.globalState.update("CheckIfOpened", false)
-	}))
-
-	Context.subscriptions.push(VSCode.commands.registerCommand("roblox-ws-server.execute", () => {
-		if (Connections.length == 0) return VSCode.window.showErrorMessage("No Connected Clients")
-
-		if (Connections.length == 1) {
-			if (!VSCode.window.activeTextEditor) return
-
-			const Table						= Connections[0]
-			const Name						= Table.Name
-			const WS						= Table.WS
-			const Data						= VSCode.window.activeTextEditor.document.getText()
-
-			WS.send(JSON.stringify({
-				["Method"]: "Execute",
-				["Data"]: Data,
-				["Code"]: 30
-			}))
-
-			return VSCode.window.showInformationMessage("Ran File.")
-		}
-
-		const UserList						= Connections.map(User => {
-			return { label: User.Name, description: "Connected User" };
-		})
-
-		VSCode.window.showQuickPick(UserList, { placeHolder: "Select a user." }).then((Option) => {
-			if (!Option) return
-			if (!VSCode.window.activeTextEditor) return
-
-			const Table						= Connections.find(Connection => Connection.Name === Option.label)
-			const Name						= Table.Name
-			const WS						= Table.WS
-			const Data						= VSCode.window.activeTextEditor.document.getText()
-
-			WS.send(JSON.stringify({
-				["Method"]: "Execute",
-				["Data"]: Data,
-				["Code"]: 30
-			}))
-
-			return VSCode.window.showInformationMessage("Ran File.")
-		})
-	}))
-
-	Context.subscriptions.push(Execute)
-	Context.subscriptions.push(...Commands)
-}
-
-function Deactivated() {
-	Connections.forEach(Connection => {
-        if (Connection.WS.readyState != Connection.WS.OPEN) return
-
-		Connection.WS.close()
+/* -------------------------------------------------- */
+/* HTTP / WS security                                 */
+/* -------------------------------------------------- */
+app.use(
+    helmet.contentSecurityPolicy({
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc:  ["'self'"],
+            connectSrc: ["'self'", "ws://localhost:9000"]
+        },
     })
+);
+
+app.all("/", (_, res) => res.end("Roblox WS Execution"));
+
+/* -------------------------------------------------- */
+/* VS Code output channel for logs                    */
+/* -------------------------------------------------- */
+const output = vscode.window.createOutputChannel("Roblox‑WS Logs");
+
+/* -------------------------------------------------- */
+/* WebSocket handling                                 */
+/* -------------------------------------------------- */
+app.ws("/", ws => {
+    // Kill unauthenticated sockets after 0.5 s
+    setTimeout(() => {
+        if (connections.every(c => c.ws !== ws)) ws.close();
+    }, 500);
+
+    ws.on("message", raw => {
+        let data;
+        try { data = JSON.parse(raw); } catch { return ws.send(JSON.stringify({ Code: 10 })); }
+        if (!data.Method) return ws.send(JSON.stringify({ Code: 20 }));
+
+        /* ---------- Authorisation ---------- */
+        if (data.Method === "Authorization") {
+            const existing = connections.find(c => c.name === data.Name);
+            if (existing) {
+                existing.ws = ws;
+                vscode.window.showInformationMessage(`Updated WS for ${data.Name}.`);
+            } else {
+                connections.push({ ws, name: data.Name });
+                vscode.window.showInformationMessage(`User ${data.Name} connected.`);
+            }
+        }
+
+        /* ---------- Execute‑side errors ---------- */
+        if (data.Method === "Error") {
+            vscode.window.showErrorMessage(data.Message);
+        }
+
+        /* ---------- Log output from Roblox ---------- */
+        if (data.Method === "LogOutput") {
+            output.appendLine(`[${data.Name}] ${data.Message}`);
+            output.show(true);
+        }
+
+        ws.send(JSON.stringify({ Code: 30 }));
+    });
+
+    ws.on("close", () => {
+        const idx = connections.findIndex(c => c.ws === ws);
+        if (idx !== -1) connections.splice(idx, 1);
+        console.log("WebSocket disconnected.");
+    });
+});
+
+app.listen(9000);
+
+/* -------------------------------------------------- */
+/* VS Code extension commands                         */
+/* -------------------------------------------------- */
+function activate(context) {
+    /* Status‑bar “Execute” button */
+    const execBtn           = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1000);
+    execBtn.command         = "roblox-ws-server.execute";
+    execBtn.text            = "$(notebook-execute) WS Execute";
+    execBtn.show();
+    context.subscriptions.push(execBtn);
+
+    /* Run script in active editor */
+    context.subscriptions.push(
+        vscode.commands.registerCommand("roblox-ws-server.execute", () => {
+            if (connections.length === 0)
+                return vscode.window.showErrorMessage("No connected clients.");
+
+            if (!vscode.window.activeTextEditor)
+                return vscode.window.showErrorMessage("No active editor.");
+
+            const code = vscode.window.activeTextEditor.document.getText();
+
+            const chooseClient = client => {
+                client.ws.send(JSON.stringify({ Method: "Execute", Data: code, Code: 30 }));
+                vscode.window.showInformationMessage("Ran file.");
+            };
+
+            if (connections.length === 1) return chooseClient(connections[0]);
+
+            vscode.window
+                .showQuickPick(connections.map(c => ({ label: c.name })), { placeHolder: "Select a user." })
+                .then(sel => sel && chooseClient(connections.find(c => c.name === sel.label)));
+        })
+    );
+
+    /* Misc. helper commands */
+    context.subscriptions.push(
+        vscode.commands.registerCommand("roblox-ws-server.debug", () =>
+            vscode.window.showInformationMessage("Roblox WS Execution running.")
+        )
+    );
+    context.subscriptions.push(
+        vscode.commands.registerCommand("roblox-ws-server.resetglobals", () =>
+            vscode.window.showInformationMessage("Globals reset.")
+        )
+    );
 }
 
-module.exports = {
-    ["activate"]: Activated,
-	["deactivate"]: Deactivated
+function deactivate() {
+    connections.forEach(c => c.ws.readyState === c.ws.OPEN && c.ws.close());
 }
+
+module.exports = { activate, deactivate };
