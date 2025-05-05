@@ -1,44 +1,46 @@
-local Services							= setmetatable({}, { __index = function(Self, Key) return game.GetService(game, Key) end })
-local Client							= Services.Players.LocalPlayer
-local SMethod							= (WebSocket and WebSocket.connect)
+local Services        = setmetatable({}, { __index = function(_, k) return game:GetService(k) end })
+local Client          = Services.Players.LocalPlayer
+local Connect         = (WebSocket and WebSocket.connect)
 
-if not SMethod then return Client:Kick("Executor is too shitty.") end
-
-local Main							= function()
-	local Success, WebSocket				= pcall(SMethod, "ws://localhost:9000/")
-    	local Closed						= false
-
-	if not Success then return end
-
-	WebSocket:Send(Services.HttpService:JSONEncode({
-		Method						= "Authorization",
-		Name						= Client.Name
-	}))
-
-	WebSocket.OnMessage:Connect(function(Unparsed)
-		local Parsed					= Services.HttpService:JSONDecode(Unparsed)
-		
-		if (Parsed.Method == "Execute") then
-			local Function, Error			= loadstring(Parsed.Data)
-
-			if Error then return WebSocket:Send(Services.HttpService:JSONEncode({
-				Method				= "Error",
-				Message				= Error
-			}))	end
-			
-			Function()
-		end
-	end)
-
-    WebSocket.OnClose:Connect(function()
-        Closed							= true
-    end)
-
-    repeat wait() until Closed
+if not Connect then
+    return Client:Kick("Executor is too shitty.")
 end
 
-while wait(1) do
-	local Success, Error					= pcall(Main)
+local function Main()
+    local ok, Socket = pcall(Connect, "ws://localhost:9000/")
+    if not ok then return end
+    local Closed = false
+    local Http   = Services.HttpService
 
-	if not Success then print(Error) end
+    -- Authorise
+    Socket:Send(Http:JSONEncode({ Method = "Authorization", Name = Client.Name }))
+
+    -- Receive
+    Socket.OnMessage:Connect(function(raw)
+        local data = Http:JSONDecode(raw)
+        if data.Method == "Execute" then
+            local fn, err = loadstring(data.Data)
+            if not fn then
+                return Socket:Send(Http:JSONEncode({ Method = "Error", Message = err }))
+            end
+            pcall(fn)
+        end
+    end)
+
+    -- Forward every MessageOut line to VS Code
+    Services.LogService.MessageOut:Connect(function(msg)
+        Socket:Send(Http:JSONEncode({
+            Method  = "LogOutput",
+            Name    = Client.Name,
+            Message = msg
+        }))
+    end)
+
+    Socket.OnClose:Connect(function() Closed = true end)
+    repeat task.wait() until Closed
+end
+
+while task.wait(1) do
+    local ok, err = pcall(Main)
+    if not ok then warn(err) end
 end
