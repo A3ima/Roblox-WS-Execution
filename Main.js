@@ -3,8 +3,9 @@ const helmet    = require("helmet");
 const express   = require("express");
 const expressWs = require("express-ws");
 
-const connections = [];
-const app        = expressWs(express()).app;
+// Every connection now carries its own OutputChannel
+const connections = []; // [{ name, ws, channel }]
+const app         = expressWs(express()).app;
 
 /* -------------------------------------------------- */
 /* HTTP / WS security                                 */
@@ -22,15 +23,10 @@ app.use(
 app.all("/", (_, res) => res.end("Roblox WS Execution"));
 
 /* -------------------------------------------------- */
-/* VS Code output channel for logs                    */
-/* -------------------------------------------------- */
-const output = vscode.window.createOutputChannel("Roblox‑WS Logs");
-
-/* -------------------------------------------------- */
 /* WebSocket handling                                 */
 /* -------------------------------------------------- */
 app.ws("/", ws => {
-    // Kill unauthenticated sockets after 0.5 s
+    // Drop unauthenticated sockets after 0.5 s
     setTimeout(() => {
         if (connections.every(c => c.ws !== ws)) ws.close();
     }, 500);
@@ -42,33 +38,48 @@ app.ws("/", ws => {
 
         /* ---------- Authorisation ---------- */
         if (data.Method === "Authorization") {
-            const existing = connections.find(c => c.name === data.Name);
-            if (existing) {
-                existing.ws = ws;
+            let entry = connections.find(c => c.name === data.Name);
+
+            if (entry) {
+                // Re‑use existing channel, just swap socket
+                entry.ws = ws;
                 vscode.window.showInformationMessage(`Updated WS for ${data.Name}.`);
             } else {
-                connections.push({ ws, name: data.Name });
+                const channel = vscode.window.createOutputChannel(`Roblox‑WS Logs — ${data.Name}`);
+                entry = { name: data.Name, ws, channel };
+                connections.push(entry);
                 vscode.window.showInformationMessage(`User ${data.Name} connected.`);
             }
+            return ws.send(JSON.stringify({ Code: 30 }));
         }
 
         /* ---------- Execute‑side errors ---------- */
         if (data.Method === "Error") {
             vscode.window.showErrorMessage(data.Message);
+            return ws.send(JSON.stringify({ Code: 30 }));
         }
 
         /* ---------- Log output from Roblox ---------- */
         if (data.Method === "LogOutput") {
-            output.appendLine(`[${data.Name}] ${data.Message}`);
-            output.show(true);
+            const entry = connections.find(c => c.name === data.Name);
+            if (!entry) return; // Shouldn't occur
+
+            entry.channel.appendLine(data.Message);
+            entry.channel.show(true);
+            return ws.send(JSON.stringify({ Code: 30 }));
         }
 
+        // Unknown method → just ACK
         ws.send(JSON.stringify({ Code: 30 }));
     });
 
     ws.on("close", () => {
         const idx = connections.findIndex(c => c.ws === ws);
-        if (idx !== -1) connections.splice(idx, 1);
+        if (idx === -1) return;
+
+        // Dispose the per‑user output channel
+        connections[idx].channel.dispose();
+        connections.splice(idx, 1);
         console.log("WebSocket disconnected.");
     });
 });
@@ -80,9 +91,9 @@ app.listen(9000);
 /* -------------------------------------------------- */
 function activate(context) {
     /* Status‑bar “Execute” button */
-    const execBtn           = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1000);
-    execBtn.command         = "roblox-ws-server.execute";
-    execBtn.text            = "$(notebook-execute) WS Execute";
+    const execBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1000);
+    execBtn.command = "roblox-ws-server.execute";
+    execBtn.text    = "$(notebook-execute) WS Execute";
     execBtn.show();
     context.subscriptions.push(execBtn);
 
@@ -97,16 +108,16 @@ function activate(context) {
 
             const code = vscode.window.activeTextEditor.document.getText();
 
-            const chooseClient = client => {
+            const sendTo = client => {
                 client.ws.send(JSON.stringify({ Method: "Execute", Data: code, Code: 30 }));
                 vscode.window.showInformationMessage("Ran file.");
             };
 
-            if (connections.length === 1) return chooseClient(connections[0]);
+            if (connections.length === 1) return sendTo(connections[0]);
 
             vscode.window
                 .showQuickPick(connections.map(c => ({ label: c.name })), { placeHolder: "Select a user." })
-                .then(sel => sel && chooseClient(connections.find(c => c.name === sel.label)));
+                .then(sel => sel && sendTo(connections.find(c => c.name === sel.label)));
         })
     );
 
@@ -124,7 +135,10 @@ function activate(context) {
 }
 
 function deactivate() {
-    connections.forEach(c => c.ws.readyState === c.ws.OPEN && c.ws.close());
+    connections.forEach(c => {
+        if (c.ws.readyState === c.ws.OPEN) c.ws.close();
+        c.channel.dispose();
+    });
 }
 
 module.exports = { activate, deactivate };
